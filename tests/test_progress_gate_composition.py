@@ -19,8 +19,10 @@ from unittest.mock import patch
 
 from hermes_nerve import nervous
 from hermes_nerve.progress_integrity import (
+    changed_paths_relevant,
     compose_requested_paths,
     current_profile_name,
+    mutation_is_relevant,
     requested_paths,
     verify_board_mutation,
 )
@@ -159,7 +161,7 @@ class EmptyCompositionDiagnosticTests(GateHarness):
         self.assertTrue(event["token_source"])
 
     def test_diagnostic_carries_only_hashes_of_the_prompt(self):
-        secret = "sk-live-abcdef0123456789"
+        secret = "sk-FAKE-fake-fake-fake-0000"
         message = f"Fix the deployment and rotate {secret} before you finish."
         self.start(message)
         self.system.completion_gate(turn_id="t1", coding=False)
@@ -312,6 +314,7 @@ class BoardMutationCreditTests(GateHarness):
             json.dumps({"ok": True}),
             profile=self.actor,
             started_wall=time.time() + 600,
+            status="ok",
             db_path=db,
         )
         self.assertIsNone(credit)
@@ -468,6 +471,145 @@ class CompositionDiagnosticProvenanceTests(GateHarness):
             for candidate in entry["candidates"]:
                 self.assertEqual(set(candidate), {"rule", "token_sha256", "token_chars"})
                 self.assertRegex(candidate["token_sha256"], r"^[0-9a-f]{64}$")
+
+
+class BoardCreditRelevanceTests(GateHarness):
+    """F1: a file-target turn is not credited by an unrelated board write."""
+
+    def test_cross_card_comment_does_not_credit_a_file_target_turn(self):
+        db = self._use_board()
+        state = self.start("Fix app/calc.py")
+        self.assertEqual(state.requested_paths, ("app/calc.py",))
+        # The write is real, fresh, and authored by this profile: only the
+        # prompt target makes it unrelated.
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into task_comments (task_id, author, body, created_at) values (?,?,?,?)",
+            ("t_other", self.actor, "unrelated status note", time.time()),
+        )
+        con.commit()
+        con.close()
+
+        self.system.observe_tool_call(
+            tool_name="kanban_comment",
+            args={"task_id": "t_other", "body": "unrelated status note"},
+            status="ok",
+            result=json.dumps({"ok": True, "task_id": "t_other", "comment_id": 99}),
+            turn_id="t1",
+            tool_call_id="c1",
+        )
+
+        self.assertEqual(state.board_mutations_credited, 0)
+        self.assertEqual(state.relevant_mutation_attempts, 0)
+        blocked = self.system.completion_gate(turn_id="t1", coding=True)
+        self.assertIsNotNone(blocked, "a cross-card comment is not work on app/calc.py")
+        self.assertIn("no task-relevant mutation", blocked["message"])
+        self.assertEqual(self.records("board_mutation_credited"), [])
+        uncredited = self.records("board_mutation_uncredited")
+        self.assertEqual(len(uncredited), 1)
+        self.assertEqual(uncredited[0]["reason"], "prompt names a source file")
+
+
+class FailedCallCreditTests(GateHarness):
+    """F2: credit is bound to the observed call, not to any matching row."""
+
+    def test_failed_call_is_not_credited_from_a_matching_fresh_row(self):
+        db = self._use_board()
+        state = self.start("Fix the nerve gate in kanban.db")
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into task_comments (task_id, author, body, created_at) values (?,?,?,?)",
+            ("t_ac8ba462", self.actor, "dup receipt", time.time()),
+        )
+        con.commit()
+        con.close()
+
+        self.system.observe_tool_call(
+            tool_name="kanban_comment",
+            args={"task_id": "t_ac8ba462", "body": "dup receipt"},
+            status="error",
+            result="",
+            error_message="tool failed: not written",
+            turn_id="t1",
+            tool_call_id="c1",
+        )
+
+        self.assertEqual(state.board_mutations_credited, 0)
+        blocked = self.system.completion_gate(turn_id="t1", coding=True)
+        self.assertIsNotNone(blocked, "a failed call is not a write")
+        self.assertIn("no task-relevant mutation", blocked["message"])
+        uncredited = self.records("board_mutation_uncredited")
+        self.assertEqual(len(uncredited), 1)
+        self.assertEqual(uncredited[0]["reason"], "tool call failed")
+
+    def test_row_written_before_the_turn_does_not_credit_a_successful_call(self):
+        db = self._use_board()
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into task_comments (task_id, author, body, created_at) values (?,?,?,?)",
+            ("t_ac8ba462", self.actor, "dup receipt", time.time() - 60.0),
+        )
+        con.commit()
+        con.close()
+        state = self.start("Fix the nerve gate in kanban.db")
+
+        self.system.observe_tool_call(
+            tool_name="kanban_comment",
+            args={"task_id": "t_ac8ba462", "body": "dup receipt"},
+            status="ok",
+            result=json.dumps({"ok": True, "task_id": "t_ac8ba462", "comment_id": 7}),
+            turn_id="t1",
+            tool_call_id="c1",
+        )
+
+        self.assertEqual(state.board_mutations_credited, 0)
+        blocked = self.system.completion_gate(turn_id="t1", coding=True)
+        self.assertIsNotNone(blocked, "a pre-turn row is not this call's write")
+        self.assertIn("no task-relevant mutation", blocked["message"])
+        uncredited = self.records("board_mutation_uncredited")
+        self.assertEqual(len(uncredited), 1)
+        self.assertEqual(uncredited[0]["reason"], "no matching board row read back")
+
+
+class DirectoryTargetRelevanceTests(GateHarness):
+    """F3: a file under a composed directory is work on that target."""
+
+    def test_file_under_a_composed_directory_satisfies_the_gate(self):
+        state = self.start(INCIDENT_PROMPT)
+        directory = state.requested_paths[0]
+        self.system.observe_tool_call(
+            tool_name="patch",
+            args={"path": directory + "/run.log"},
+            status="ok",
+            result="",
+            turn_id="t1",
+            tool_call_id="c1",
+        )
+
+        self.assertEqual(state.relevant_mutation_attempts, 1)
+        self.assertEqual(state.board_mutations_credited, 0)
+        self.assertIsNone(
+            self.system.completion_gate(turn_id="t1", coding=True),
+            "the requested directory write must satisfy the gate",
+        )
+        self.assertEqual(self.records("progress_completion_blocked"), [])
+
+    def test_directory_prefix_match_keeps_parent_and_relative_decoys_out(self):
+        directory = "/opt/data/profiles/tester/cron/output/fa0ed41171f7"
+        self.assertTrue(
+            mutation_is_relevant("patch", {"path": directory + "/run.log"}, (directory,))
+        )
+        self.assertTrue(changed_paths_relevant([directory + "/run.log"], (directory,)))
+        self.assertFalse(
+            mutation_is_relevant(
+                "patch", {"path": directory + "/../evil/run.log"}, (directory,)
+            ),
+            "a parent segment may not escape the composed directory",
+        )
+        self.assertFalse(
+            mutation_is_relevant("patch", {"path": "evil/app/calc.py"}, ("app/calc.py",)),
+            "a relative decoy must not count as work on the target",
+        )
 
 
 if __name__ == "__main__":

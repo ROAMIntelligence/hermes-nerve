@@ -38,7 +38,9 @@ from .privacy import canonical_hash, redact
 from .policy_memory import PolicyMemory, tool_wide_policy_reason
 from .provenance import execution_provenance
 from .progress_integrity import (
+    board_credit_is_relevant,
     board_mutation_kind,
+    call_succeeded,
     change_required as progress_change_required,
     changed_paths_relevant,
     compose_requested_paths as progress_compose_requested_paths,
@@ -1027,16 +1029,37 @@ class NervousSystem:
                 board_kind = board_mutation_kind(tool_name)
                 if board_kind:
                     # Orchestrator turns write cards, not files: credit a board
-                    # write only after reading the row back and binding it to
-                    # this profile inside this turn's window (t_ac8ba462).
-                    credit = verify_board_mutation(
-                        board_kind,
-                        args,
-                        result,
-                        profile=current_profile_name(),
-                        current_task=str(os.getenv("HERMES_KANBAN_TASK", "")).strip(),
-                        started_wall=state.started_wall,
-                    )
+                    # write only when the call succeeded, the row reads back
+                    # inside the call's own window for this profile, and the
+                    # board write is what the prompt asked for (t_ac8ba462;
+                    # F1/F2 of the t_8a8c6d9c review). Failed calls, stale rows
+                    # and work on an unrelated card earn no credit, and are
+                    # logged as uncredited rather than passing silently.
+                    uncredited_reason = ""
+                    credit = None
+                    try:
+                        duration_ms = float(kwargs.get("duration_ms") or 0.0)
+                    except (TypeError, ValueError):
+                        duration_ms = 0.0
+                    call_started = time.time() - (duration_ms / 1000.0) if duration_ms > 0 else 0.0
+                    if not call_succeeded(status, error_message):
+                        uncredited_reason = "tool call failed"
+                    elif not board_credit_is_relevant(state.requested_path_sources):
+                        uncredited_reason = "prompt names a source file"
+                    else:
+                        credit = verify_board_mutation(
+                            board_kind,
+                            args,
+                            result,
+                            profile=current_profile_name(),
+                            current_task=str(os.getenv("HERMES_KANBAN_TASK", "")).strip(),
+                            started_wall=state.started_wall,
+                            call_started_wall=call_started,
+                            status=status,
+                            error_message=error_message,
+                        )
+                        if credit is None:
+                            uncredited_reason = "no matching board row read back"
                     if credit is not None:
                         state.mutation_attempts += 1
                         state.relevant_mutation_attempts += 1
@@ -1047,6 +1070,14 @@ class NervousSystem:
                             "tool_name": tool_name,
                             "requested_paths": list(state.requested_paths),
                             **credit,
+                        })
+                    else:
+                        self._log("board_mutation_uncredited", {
+                            "turn_id": state.turn_id,
+                            "session_id": state.session_id,
+                            "tool_name": tool_name,
+                            "requested_paths": list(state.requested_paths),
+                            "reason": uncredited_reason,
                         })
                 elif kind == "mutation":
                     state.mutation_attempts += 1

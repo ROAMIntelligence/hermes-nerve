@@ -73,7 +73,12 @@ BOARD_MUTATION_TOOLS: dict[str, str] = {
     "kanban_create": "create",
     "kanban_comment": "comment",
 }
-_BOARD_WINDOW_SKEW_SECONDS = 120.0
+_BOARD_SUCCESS_STATUSES = frozenset({"ok", "success", "passed", "pass"})
+# A credited row must have been written by the observed call: at or after the
+# call started (minus clock granularity) and no later than the observation.
+# The former +/-120s reach-back let a row written before the turn credit a
+# call that never wrote it (F2, t_8a8c6d9c review).
+_BOARD_CLOCK_TOLERANCE_SECONDS = 1.0
 
 # Harness-supplied instruction files (Paperclip agent instructions, wake payloads,
 # execution contracts) are not a task statement. Deriving "this turn must change
@@ -767,9 +772,22 @@ def _normalize_path(value: str) -> str:
     return raw
 
 
+def _has_parent_segment(value: str) -> bool:
+    return any(part == ".." for part in PurePosixPath(value).parts)
+
+
+def _is_directory_target(target: str) -> bool:
+    """An extensionless composed target is a directory (abs_dir token)."""
+    name = PurePosixPath(target).name
+    return bool(name) and "." not in name
+
+
 def _same_or_related(path: str, target: str) -> bool:
     a = path.casefold().rstrip("/")
     b = target.casefold().rstrip("/")
+    # A parent segment can only escape the composed target, never work on it.
+    if _has_parent_segment(a) or _has_parent_segment(b):
+        return False
     if a == b:
         return True
     # Suffix matches are only trusted when the longer path is absolute (e.g. a
@@ -779,6 +797,11 @@ def _same_or_related(path: str, target: str) -> bool:
         return a.startswith("/")
     if b.endswith("/" + a):
         return b.startswith("/")
+    # A file written under a composed directory target is work on that target
+    # (F3, t_8a8c6d9c review): the prompt asked for directory work, so its
+    # files belong to it. Absolute targets only reach absolute paths.
+    if _is_directory_target(b) and a.startswith(b + "/"):
+        return True
     return False
 
 
@@ -833,6 +856,31 @@ def current_profile_name() -> str:
     return explicit or "default"
 
 
+def call_succeeded(status: str, error_message: str = "") -> bool:
+    """Only an explicit success status with no error text proves a write."""
+    return (
+        str(status or "").strip().lower() in _BOARD_SUCCESS_STATUSES
+        and not str(error_message or "").strip()
+    )
+
+
+def board_credit_is_relevant(sources: Any) -> bool:
+    """Whether a verified board write is work on what the prompt asked for.
+
+    A prompt that names a source file (a ``path_token`` composition rule) asked
+    for file work; a comment or card creation is then not the requested product,
+    whichever card it touches (F1, t_8a8c6d9c review). Board/directory-only
+    prompts have no ``path_token`` rule, and their work product is the board.
+    """
+    for source in sources or ():
+        try:
+            if str(source.get("rule") or "") == "path_token":
+                return False
+        except AttributeError:
+            continue
+    return True
+
+
 def _kanban_db_path() -> Path | None:
     env = os.getenv("HERMES_KANBAN_DB", "").strip()
     candidates: list[Path] = [Path(env)] if env else []
@@ -877,25 +925,34 @@ def verify_board_mutation(
     profile: str = "",
     current_task: str = "",
     started_wall: float = 0.0,
+    call_started_wall: float = 0.0,
+    status: str = "",
+    error_message: str = "",
     now: float | None = None,
     db_path: Path | None = None,
 ) -> dict[str, Any] | None:
     """Read the board back and return credit evidence for a real board write.
 
-    Credit requires the row to exist, to match the call's own content, to be
-    authored by THIS profile, and to fall inside the turn's wall-clock window.
-    Unrelated or failed writes return None: a call is not a write, and an
-    unrelated comment is not task-relevant progress.
+    Credit requires the observed call to have succeeded, and a row that exists
+    inside the call's own window (its start when the caller knows it, else the
+    turn start -- never a reach-back before the turn), matches the call's
+    content, and is authored by THIS profile. A failed call, or a row written
+    before the call, returns None: a call is not a write, and a stale row is
+    not this call's write. Task relevance is the caller's decision, made from
+    the composed targets with ``board_credit_is_relevant``.
     """
     args = args or {}
     if not kind:
+        return None
+    if not call_succeeded(status, error_message):
         return None
     now = time.time() if now is None else now
     db = db_path or _kanban_db_path()
     if db is None:
         return None
-    since = float(started_wall or now) - _BOARD_WINDOW_SKEW_SECONDS
-    until = now + _BOARD_WINDOW_SKEW_SECONDS
+    base = float(call_started_wall or started_wall or now)
+    since = base - _BOARD_CLOCK_TOLERANCE_SECONDS
+    until = now + _BOARD_CLOCK_TOLERANCE_SECONDS
     actor = str(profile or "").strip()
     current = str(current_task or "").strip()
     try:
